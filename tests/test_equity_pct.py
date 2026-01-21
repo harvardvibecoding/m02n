@@ -1,3 +1,11 @@
+### Headcount Simulator App
+### m02n/tests/test_equity_pct.py
+###
+### Author: Sharon + GitHub Copilot
+### Date: Jan 20, 2026
+###
+### Headcount app tests for equity percentage feature.
+
 import pandas as pd
 import pytest
 from pathlib import Path

@@ -1,3 +1,11 @@
+### Headcount Simulator App
+### m02n/people_headcount_app.py
+###
+### Author: Sharon + GitHub Copilot
+### Date: Jan 20, 2026
+###
+### Headcount app with equity percentage feature.
+
 import streamlit as st
 import pandas as pd
 from pathlib import Path
