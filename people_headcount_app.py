@@ -1,11 +1,3 @@
-### Headcount Simulator App
-### m02n/people_headcount_app.py
-###
-### Author: Sharon + GitHub Copilot
-### Date: Jan 20, 2026
-###
-### Headcount app with equity percentage feature.
-
 import streamlit as st
 import pandas as pd
 from pathlib import Path
@@ -55,13 +47,77 @@ st.markdown('<div class="app-sub">Set a target headcount and prioritize hires by
 st.markdown('<div class="harvard-hr"></div>', unsafe_allow_html=True)
 
 
+def detect_equity_format(df: pd.DataFrame) -> dict:
+    """
+    Detect the equity column and its format (percentage vs shares).
+    Returns dict with keys: 'column_name', 'format' ('pct', 'shares', 'value', or None), 'raw_values'
+    """
+    result = {"column_name": None, "format": None, "raw_values": None}
+    
+    # Priority order for equity column detection
+    equity_col_candidates = [
+        # Percentage columns (highest priority if named explicitly)
+        ("equity_pct", "pct"),
+        ("equity_percent", "pct"),
+        ("ownership_pct", "pct"),
+        ("ownership_percent", "pct"),
+        # Share columns
+        ("equity_shares", "shares"),
+        ("shares", "shares"),
+        ("stock_options", "shares"),
+        ("options", "shares"),
+        # Value columns (RSU grants, etc.)
+        ("rsu_grant_value", "value"),
+        ("equity_value", "value"),
+        ("grant_value", "value"),
+        # Generic equity column - need to infer format
+        ("equity", None),
+    ]
+    
+    cols_lower = {c.lower(): c for c in df.columns}
+    
+    for candidate, fmt in equity_col_candidates:
+        if candidate in cols_lower:
+            actual_col = cols_lower[candidate]
+            result["column_name"] = actual_col
+            
+            # Parse numeric values
+            raw_values = pd.to_numeric(df[actual_col], errors="coerce")
+            result["raw_values"] = raw_values
+            
+            if fmt is not None:
+                result["format"] = fmt
+            else:
+                # Infer format from values for generic "equity" column
+                max_val = raw_values.max()
+                if pd.isna(max_val):
+                    result["format"] = "pct"  # default to pct if no valid values
+                elif max_val <= 100:
+                    # Values are <= 100, likely percentages
+                    result["format"] = "pct"
+                else:
+                    # Values > 100, likely shares
+                    result["format"] = "shares"
+            return result
+    
+    return result
+
+
 @st.cache_data
-def load_roster(csv_source) -> pd.DataFrame:
+def load_roster(csv_source) -> tuple[pd.DataFrame, dict]:
+    """
+    Load roster CSV and detect equity format.
+    Returns (DataFrame, equity_info dict).
+    """
     # Read CSV; file contains a "Summary Statistics" section at the bottom, so coerce comp_usd and drop non-employee rows.
     df = pd.read_csv(csv_source, dtype=str, keep_default_na=False)
+    
+    # Detect equity format BEFORE normalization (to preserve original column names)
+    equity_info = detect_equity_format(df)
+    
     # Normalize columns
     # map common alternative column names to expected schema
-    def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    def normalize_columns(df: pd.DataFrame, equity_info: dict) -> pd.DataFrame:
         mapping = {}
         if "employee_name" in df.columns and "name" not in df.columns:
             mapping["employee_name"] = "name"
@@ -81,13 +137,9 @@ def load_roster(csv_source) -> pd.DataFrame:
             mapping["salary"] = "comp_usd"
         if "total_comp" in df.columns and "comp_usd" not in df.columns:
             mapping["total_comp"] = "comp_usd"
-        # equity columns
-        if "equity_pct" in df.columns and "equity_pct" not in df.columns:
-            mapping["equity_pct"] = "equity_pct"
-        if "equity" in df.columns and "equity_pct" not in df.columns:
-            mapping["equity"] = "equity_pct"
-        if "equity_shares" in df.columns and "equity_pct" not in df.columns:
-            mapping["equity_shares"] = "equity_pct"
+        # Map detected equity column to equity_raw (we'll convert later)
+        if equity_info["column_name"] is not None and equity_info["column_name"] != "equity_raw":
+            mapping[equity_info["column_name"]] = "equity_raw"
         if "employee_id" not in df.columns:
             # try common id column names
             if "id" in df.columns:
@@ -96,7 +148,7 @@ def load_roster(csv_source) -> pd.DataFrame:
             df = df.rename(columns=mapping)
         return df
 
-    df = normalize_columns(df)
+    df = normalize_columns(df, equity_info)
 
     if "comp_usd" not in df.columns:
         raise RuntimeError("Expected column 'comp_usd' in roster CSV (found: {})".format(", ".join(df.columns)))
@@ -112,14 +164,14 @@ def load_roster(csv_source) -> pd.DataFrame:
     df = df.dropna(subset=["comp_usd"])
     # Convert comp to integer
     df["comp_usd"] = df["comp_usd"].astype(int)
-    return df
+    return df, equity_info
 
 
 try:
     # Allow user to upload an alternate roster CSV
     uploaded = st.sidebar.file_uploader("Upload employee roster CSV", type=["csv"])
     source = uploaded if uploaded is not None else CSV_PATH
-    roster_df = load_roster(source)
+    roster_df, equity_info = load_roster(source)
 except Exception as exc:
     st.error(f"Could not load roster: {exc}")
     st.stop()
@@ -127,6 +179,29 @@ except Exception as exc:
 total_employees = int(roster_df.shape[0])
 
 st.sidebar.header("Scenario inputs")
+
+# Handle equity format detection and conversion
+equity_format_detected = equity_info.get("format")
+equity_col_name = equity_info.get("column_name")
+total_shares_outstanding = None
+
+if equity_format_detected == "shares":
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(f"**Equity detected as shares** (from `{equity_col_name}`)")
+    total_shares_outstanding = st.sidebar.number_input(
+        "Total shares outstanding",
+        min_value=1,
+        value=50_000_000,  # Default value; user should adjust
+        step=1_000_000,
+        help="Enter total shares outstanding to convert share counts to ownership percentages."
+    )
+    st.sidebar.markdown(f"<span class='small-note'>Shares will be converted to % ownership</span>", unsafe_allow_html=True)
+    st.sidebar.markdown("---")
+elif equity_format_detected == "value":
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(f"**Equity detected as grant value** (from `{equity_col_name}`)")
+    st.sidebar.markdown("<span class='small-note'>Grant values will be used for relative comparison (not % ownership)</span>", unsafe_allow_html=True)
+    st.sidebar.markdown("---")
 target_headcount = st.sidebar.slider(
     "Target headcount",
     min_value=0,
@@ -213,8 +288,24 @@ def map_level_to_score(level_series: pd.Series) -> pd.Series:
 roster_df["tenure_years"] = compute_tenure_years(roster_df.get("start_date", pd.Series([""] * len(roster_df))))
 roster_df["direct_reports"] = compute_direct_reports_count(roster_df)
 roster_df["level_score"] = map_level_to_score(roster_df.get("level", pd.Series([""] * len(roster_df))))
-# equity: normalize equity_pct if present, otherwise fill 0
-if "equity_pct" in roster_df.columns:
+# equity: convert to percentage based on detected format
+if "equity_raw" in roster_df.columns:
+    equity_raw = pd.to_numeric(roster_df["equity_raw"], errors="coerce").fillna(0.0)
+    
+    if equity_format_detected == "shares" and total_shares_outstanding is not None and total_shares_outstanding > 0:
+        # Convert shares to percentage: (shares / total_shares_outstanding) * 100
+        roster_df["equity_pct"] = (equity_raw / total_shares_outstanding) * 100
+    elif equity_format_detected == "value":
+        # For grant values, normalize to a 0-100 scale for relative comparison
+        max_value = equity_raw.max()
+        if max_value > 0:
+            roster_df["equity_pct"] = (equity_raw / max_value) * 100
+        else:
+            roster_df["equity_pct"] = 0.0
+    else:
+        # Already percentage or unknown format - use as-is
+        roster_df["equity_pct"] = equity_raw
+elif "equity_pct" in roster_df.columns:
     roster_df["equity_pct"] = pd.to_numeric(roster_df["equity_pct"], errors="coerce").fillna(0.0)
 else:
     roster_df["equity_pct"] = 0.0
@@ -252,6 +343,12 @@ k2.markdown(card_template.format(label="Total compensation", value=_fmt(total_co
 k3.markdown(card_template.format(label="Average compensation", value=_fmt(average_cost) if selected.shape[0] else "$0"), unsafe_allow_html=True)
 k4.markdown(card_template.format(label="Median compensation", value=_fmt(median_cost) if selected.shape[0] else "$0"), unsafe_allow_html=True)
 
+# Show equity format info if shares were converted
+if equity_format_detected == "shares" and total_shares_outstanding:
+    st.info(f"**Equity conversion:** Share counts from `{equity_col_name}` converted to ownership % using {total_shares_outstanding:,} total shares outstanding.")
+elif equity_format_detected == "value":
+    st.info(f"**Equity format:** Grant values from `{equity_col_name}` normalized to relative scores (0-100) for comparison.")
+
 st.markdown("### Selected employees")
 if selected.empty:
     st.info("No employees selected for the current headcount.")
@@ -272,11 +369,17 @@ else:
             "impact_score": "Impact score",
         }
     )
-    display_df["Compensation (USD)"] = display_df["Compensation (USD)"].map(lambda x: _fmt(int(x)))
+    display_df["Compensation (USD)"] = display_df["Compensation (USD)"].map(lambda x: _fmt(int(x) * -1))
     # Format impact score as a rounded float for display
     display_df["Impact score"] = display_df["Impact score"].map(lambda x: f"{float(x):.3f}" if x not in (None, "") else "")
-    # Format equity as percentage if present
-    display_df["Equity %"] = display_df["Equity %"].map(lambda x: f"{float(x):.2f}%" if x not in (None, "") and x != "" else "")
+    # Format equity based on detected format
+    if equity_format_detected == "value":
+        # For grant values, show as relative score (already normalized to 0-100)
+        display_df = display_df.rename(columns={"Equity %": "Equity Score"})
+        display_df["Equity Score"] = display_df["Equity Score"].map(lambda x: f"{float(x):.1f}" if x not in (None, "") and x != "" else "")
+    else:
+        # For shares (converted) or native percentages, show as percentage
+        display_df["Equity %"] = display_df["Equity %"].map(lambda x: f"{float(x):.4f}%" if x not in (None, "") and x != "" else "")
     # nicer table
     st.markdown('<div class="data-table">', unsafe_allow_html=True)
     st.table(display_df)
@@ -291,5 +394,6 @@ else:
 # (Graph removed — selection table and KPIs provide the required information)
 
 st.markdown("---")
-st.caption(f"Roster source: `{CSV_PATH}` — total employees in roster: {total_employees}")
+source_label = uploaded.name if uploaded is not None else str(CSV_PATH)
+st.caption(f"Roster source: `{source_label}` — total employees in roster: {total_employees}")
 
